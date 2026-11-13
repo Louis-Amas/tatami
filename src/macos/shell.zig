@@ -562,6 +562,12 @@ fn focus_left_check(id: u32) void {
 
 /// Native tabs: when the focused window sits exactly where another window of the same
 /// application sat, and that one is no longer on screen, they are tabs of each other.
+/// With native Spaces, two windows that macOS puts on different Spaces. A Space that is
+/// not known yet is no reason to tell them apart.
+fn same_space(a: u64, b: u64) bool {
+    return !spaces_on or a == 0 or b == 0 or a == b;
+}
+
 fn tabs_check(focused_id: u32) void {
     const focused = window_find(focused_id) orelse return;
     if (app_hidden(focused.pid)) return;
@@ -570,6 +576,7 @@ fn tabs_check(focused_id: u32) void {
         if (other.id == 0 or other.id == focused_id or other.pid != focused.pid) continue;
         const known = engine.window_find(other.id) orelse continue;
         if (known.tab_of != 0 or known.minimized) continue;
+        if (!same_space(focused.space, other.space)) continue;
         if (!known.actual.eql(frame)) continue;
         if (ax.on_screen(other.id)) continue;
         dispatch(.{ .window_tab_changed = .{ .id = other.id, .tab_of = focused_id } });
@@ -618,7 +625,7 @@ fn window_discover(app: *ShellApp, element: Ref) Discovery {
         .resizable = ax.settable(element, ax.names.size),
         .minimized = app.hidden or ax.bool_get(element, ax.names.minimized),
         .fullscreen = ax.bool_get(element, ax.names.fullscreen),
-        .tab_of = tab_leader(app.pid, id, frame),
+        .tab_of = tab_leader(app.pid, id, frame, window.space),
         .adopted = app.adopted,
         .workspace = if (app.adopted) left.window_find(id, app.pid) else null,
         .space = window.space,
@@ -671,11 +678,13 @@ fn probes_run(now: u64) void {
 
 /// A new window that appears exactly on top of a window of the same application which
 /// has just gone off screen is a new tab of it.
-fn tab_leader(pid: i32, id: u32, frame: Rect) u32 {
+fn tab_leader(pid: i32, id: u32, frame: Rect, space: u64) u32 {
     // The windows of a hidden application are off screen without being tabs of anything.
     if (app_hidden(pid)) return 0;
     for (&windows) |*other| {
         if (other.id == 0 or other.id == id or other.pid != pid) continue;
+        // A window on another Space is off screen without being a tab: tabs share a Space.
+        if (!same_space(space, other.space)) continue;
         const known = engine.window_find(other.id) orelse continue;
         if (known.minimized or !known.actual.eql(frame)) continue;
         if (!ax.on_screen(other.id)) return other.id;
@@ -1214,8 +1223,19 @@ fn spaces_poll(initial: bool) void {
     spaces.windows_spaces(&spaces_seen, ids[0..count], found[0..count]);
     for (ids[0..count], found[0..count]) |id, space| {
         const window = window_find(id) orelse continue;
-        if (space == 0 or space == window.space) continue;
-        window.space = space;
+        if (space != 0) window.space = space;
+    }
+    // A window taken for a native tab of a window on another Space is a window of its own.
+    for (ids[0..count]) |id| {
+        const window = window_find(id) orelse continue;
+        const known = engine.window_find(id) orelse continue;
+        if (known.tab_of == 0) continue;
+        const leader = window_find(known.tab_of) orelse continue;
+        if (same_space(window.space, leader.space)) continue;
+        dispatch(.{ .window_tab_changed = .{ .id = id, .tab_of = 0 } });
+    }
+    for (ids[0..count], found[0..count]) |id, space| {
+        if (space == 0) continue;
         dispatch(.{ .window_space = .{ .id = id, .space = space } });
     }
 }
