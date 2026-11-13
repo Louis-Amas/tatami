@@ -194,8 +194,11 @@ pub fn read(snapshot: *Snapshot, identity: *const fn (c.CGDirectDisplayID) u32) 
     return snapshot.shown_count > 0;
 }
 
-/// The desktop Space each window is on, 0 for one on a fullscreen Space, on every Space,
-/// or not known. One call to the window server for all of them.
+/// What windows_spaces says of a window that is alone on a fullscreen Space.
+pub const fullscreen_space: u64 = std.math.maxInt(u64);
+
+/// The desktop Space each window is on, fullscreen_space for one on a fullscreen Space,
+/// and 0 for one on every Space or not known.
 pub fn windows_spaces(snapshot: *const Snapshot, ids: []const u32, out: []u64) void {
     std.debug.assert(out.len >= ids.len);
     for (out[0..ids.len]) |*space| space.* = 0;
@@ -216,7 +219,7 @@ pub fn windows_spaces(snapshot: *const Snapshot, ids: []const u32, out: []u64) v
         const first = c.CFArrayGetValueAtIndex(spaces, 0);
         if (c.CFNumberGetValue(first, number_sint64, &space) == 0) continue;
         const found: u64 = @bitCast(space);
-        if (snapshot.is_desktop(found)) out[index] = found;
+        out[index] = if (snapshot.is_desktop(found)) found else fullscreen_space;
     }
 }
 

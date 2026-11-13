@@ -84,6 +84,9 @@ const ShellWindow = struct {
     dragging: bool = false,
     /// With native Spaces, the desktop Space it was last seen on, 0 when not known.
     space: u64 = 0,
+    /// macOS put it on a fullscreen Space of its own, whatever the application says:
+    /// Chrome in the full screen of a video does not call itself fullscreen.
+    space_fullscreen: bool = false,
 };
 
 /// Events that an effect leads to. They carry no slices, so they can wait in a queue while
@@ -611,7 +614,8 @@ fn window_discover(app: *ShellApp, element: Ref) Discovery {
     if (spaces_on) {
         var found: [1]u64 = undefined;
         spaces.windows_spaces(&spaces_seen, &.{id}, &found);
-        window.space = found[0];
+        window.space_fullscreen = found[0] == spaces.fullscreen_space;
+        window.space = if (window.space_fullscreen) 0 else found[0];
     }
     var title_buffer: [1024]u8 = undefined;
     const title = ax.string_get(element, ax.names.title, &title_buffer);
@@ -624,7 +628,7 @@ fn window_discover(app: *ShellApp, element: Ref) Discovery {
         .kind = kind,
         .resizable = ax.settable(element, ax.names.size),
         .minimized = app.hidden or ax.bool_get(element, ax.names.minimized),
-        .fullscreen = ax.bool_get(element, ax.names.fullscreen),
+        .fullscreen = window.space_fullscreen or ax.bool_get(element, ax.names.fullscreen),
         .tab_of = tab_leader(app.pid, id, frame, window.space),
         .adopted = app.adopted,
         .workspace = if (app.adopted) left.window_find(id, app.pid) else null,
@@ -764,7 +768,9 @@ fn frame_report(window: *ShellWindow, by_user: bool) void {
         const ask = was or !known.desired_valid or !frame.eql(known.desired);
         // An application that does not answer has not left fullscreen.
         const name = ax.names.fullscreen;
-        const fullscreen = if (ask) ax.bool_get_checked(window.element, name) catch was else was;
+        const said = if (ask) ax.bool_get_checked(window.element, name) catch was else was;
+        // Alone on a fullscreen Space it is fullscreen, whatever the application says.
+        const fullscreen = window.space_fullscreen or said;
         if (untabbed) dispatch(.{ .window_tab_changed = .{ .id = id, .tab_of = 0 } });
         if (fullscreen != was) {
             dispatch(.{ .window_fullscreen = .{ .id = id, .fullscreen = fullscreen } });
@@ -1223,7 +1229,12 @@ fn spaces_poll(initial: bool) void {
     spaces.windows_spaces(&spaces_seen, ids[0..count], found[0..count]);
     for (ids[0..count], found[0..count]) |id, space| {
         const window = window_find(id) orelse continue;
-        if (space != 0) window.space = space;
+        const alone = space == spaces.fullscreen_space;
+        if (alone != window.space_fullscreen and (alone or space != 0)) {
+            window.space_fullscreen = alone;
+            dispatch(.{ .window_fullscreen = .{ .id = id, .fullscreen = alone } });
+        }
+        if (space != 0 and !alone) window.space = space;
     }
     // A window taken for a native tab of a window on another Space is a window of its own.
     for (ids[0..count]) |id| {
@@ -1235,7 +1246,7 @@ fn spaces_poll(initial: bool) void {
         dispatch(.{ .window_tab_changed = .{ .id = id, .tab_of = 0 } });
     }
     for (ids[0..count], found[0..count]) |id, space| {
-        if (space == 0) continue;
+        if (space == 0 or space == spaces.fullscreen_space) continue;
         dispatch(.{ .window_space = .{ .id = id, .space = space } });
     }
 }
