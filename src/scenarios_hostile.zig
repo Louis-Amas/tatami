@@ -126,7 +126,7 @@ const World = struct {
                 .reload => if (world.reload_with) |config| world.engine.config_replace(config),
                 // The shell looks the words up in the configuration that is in use.
                 .exec => |span| world.exec_bytes += world.engine.config.strings.get(span).len,
-                .warp_mouse => {},
+                .warp_mouse, .space_switch, .space_send => {},
             }
         }
         if (world.verify_each) world.engine.verify();

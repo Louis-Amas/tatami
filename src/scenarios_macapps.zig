@@ -149,7 +149,7 @@ fn deliver(os: *sim.Simulator, event: Event) void {
                     followups[count] = .{ .focus_reported = os.focused };
                     count += 1;
                 },
-                .warp_mouse, .exec, .reload, .quit => {},
+                .warp_mouse, .exec, .reload, .quit, .space_switch, .space_send => {},
             }
         }
         engine.verify();

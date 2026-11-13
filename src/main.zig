@@ -9,12 +9,14 @@
 //!   tatami rescue           bring windows that are parked off screen back; needs no manager
 //!   tatami bench            time the engine on a synthetic workload
 //!   tatami default-config   print the built-in configuration
+//!   tatami default-config amethyst   print Amethyst's layouts and shortcuts as a configuration
 const std = @import("std");
 const assert = std.debug.assert;
 const c = @import("macos/c.zig");
 const ax = @import("macos/ax.zig");
 const ipc = @import("macos/ipc.zig");
 const shell = @import("macos/shell.zig");
+const spaces = @import("macos/spaces.zig");
 const stdx = @import("stdx.zig");
 const geometry = @import("geometry.zig");
 const command = @import("command.zig");
@@ -53,7 +55,13 @@ pub export fn main(argc: c_int, argv: [*][*:0]u8) c_int {
     }
     if (std.mem.eql(u8, first, "bench")) return bench();
     if (std.mem.eql(u8, first, "default-config")) {
-        _ = c.write(1, config_module.default_source.ptr, config_module.default_source.len);
+        if (count == 2) {
+            _ = c.write(1, config_module.default_source.ptr, config_module.default_source.len);
+            return 0;
+        }
+        if (count != 3 or !std.mem.eql(u8, std.mem.span(argv[2]), "amethyst")) return usage(2);
+        const source = config_module.amethyst_source;
+        _ = c.write(1, source.ptr, source.len);
         return 0;
     }
     if (std.mem.eql(u8, first, "events")) {
@@ -191,7 +199,8 @@ fn wait_closed(fd: c_int, id: i32, deadline_ms: u64) c_int {
 
 fn usage(code: c_int) c_int {
     out(
-        \\usage: tatami start [--verbose] | check | probe | rescue | bench | default-config
+        \\usage: tatami start [--verbose] | check | probe | rescue | bench
+        \\       tatami default-config [amethyst]
         \\       tatami <command>      for example: tatami focus west, tatami workspace 3,
         \\                             tatami query windows, tatami reload, tatami quit
         \\
@@ -235,6 +244,42 @@ fn trusted_or_explain() bool {
     return false;
 }
 
+/// What 'spaces native' would see: the desktops, which one each display shows, and
+/// whether Mission Control has the shortcuts that switching and throwing use.
+fn spaces_report() void {
+    if (!spaces.init()) {
+        out("spaces: this macOS does not have the calls 'spaces native' needs\n", .{});
+        return;
+    }
+    var snapshot: spaces.Snapshot = .{};
+    if (!spaces.read(&snapshot, shell.display_identity_alone)) {
+        out("spaces: could not be read\n", .{});
+        return;
+    }
+    out("spaces: {d} desktops\n", .{snapshot.desktops_count});
+    for (snapshot.shown_slice()) |shown| {
+        out("  display {d} shows desktop {d} (Space {d})\n", .{
+            shown.display, snapshot.desktop_number(shown.space), shown.space,
+        });
+    }
+    out("  desktops:", .{});
+    for (snapshot.desktops[0..snapshot.desktops_count]) |space| out(" {d}", .{space});
+    out("\n", .{});
+    var off: u32 = 0;
+    var missing: u32 = 0;
+    var number: u32 = 1;
+    while (number <= snapshot.desktops_count) : (number += 1) {
+        switch (spaces.shortcut_state(number)) {
+            .on => {},
+            .off => off += 1,
+            .missing => missing += 1,
+        }
+    }
+    out("  Switch to Desktop shortcuts: {d} on, {d} off (turned on when used), {d} missing\n", .{
+        snapshot.desktops_count - off - missing, off, missing,
+    });
+}
+
 fn check() c_int {
     const trusted = c.AXIsProcessTrusted() != 0;
     out("accessibility permission: {s}\n", .{if (trusted) "granted" else "MISSING"});
@@ -252,6 +297,7 @@ fn check() c_int {
             monitor.display, if (monitor.main) " (main)" else "", v.x, v.y, v.w, v.h,
         });
     }
+    spaces_report();
     var holder_buffer: [256]u8 = undefined;
     var holder_pid: i32 = 0;
     if (ax.secure_input_holder(&holder_buffer, &holder_pid)) |holder| {

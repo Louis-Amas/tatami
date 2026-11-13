@@ -218,7 +218,14 @@ const commands = [_][]const u8{
     "query window",                     "query window 101 --json",    "query bindings --json",
     "query workspaces --json",          "query monitors --json",      "query focus --json",
     "query stats --json",               "query commands",             "query modes --json",
-    "float --bounds 0.25,0.25,0.5,0.5", "toggle accordion",
+    "float --bounds 0.25,0.25,0.5,0.5", "toggle accordion",           "layout tall",
+    "layout tall-right",                "layout wide",                "layout two-pane",
+    "layout 3column-middle",            "layout 3column-left",        "layout 3column-right",
+    "layout widescreen-tall",           "layout column",              "layout row",
+    "layout fullscreen",                "layout next",                "layout prev",
+    "main expand",                      "main shrink",                "main more",
+    "main fewer",                       "main swap",                  "main focus",
+    "swap next",                        "swap prev",
 };
 
 pub const Coverage = struct {
@@ -417,7 +424,7 @@ pub const Simulator = struct {
                 .focus_window => |focus| simulator.perform_focus(focus.id),
                 .close_window => |close| simulator.window_close(close.id),
                 .query_focus => simulator.push(0, .{ .at_ms = 0, .seq = 0, .kind = .focus_report }),
-                .warp_mouse, .exec, .reload, .quit => {},
+                .warp_mouse, .exec, .reload, .quit, .space_switch, .space_send => {},
             }
         }
         simulator.delivered += 1;
@@ -1213,8 +1220,35 @@ pub const Simulator = struct {
             90...92 => simulator.action_fullscreen(id),
             93...94 => if (window) |w| simulator.action_hide(w.pid),
             95...96 => if (faults) simulator.action_disorder(window),
+            97...98 => if (simulator.engine.config.spaces_native) simulator.action_spaces(id),
             else => simulator.now_ms += 200,
         }
+    }
+
+    /// With native Spaces: a display slides to another of its three Spaces, or a window is
+    /// moved to another Space, as Mission Control does. The Spaces of a display are its
+    /// own: display index i has Spaces 1000 + 10 i + 0, 1 and 2.
+    fn action_spaces(simulator: *Simulator, id: WindowId) void {
+        const prng = &simulator.prng;
+        const engine = simulator.engine;
+        if (engine.monitors_count == 0) return;
+        const which = prng.below(engine.monitors_count);
+        const space: u64 = 1000 + 10 * @as(u64, which) + prng.below(3);
+        if (id != 0 and prng.chance(1, 2)) {
+            simulator.step(.{ .window_space = .{ .id = id, .space = space } });
+            return;
+        }
+        var shown: [engine_module.monitors_max]engine_module.SpaceShown = undefined;
+        for (engine.monitors[0..engine.monitors_count], 0..) |*known, index| {
+            const current = engine.workspaces[known.workspace].space;
+            const first: u64 = 1000 + 10 * @as(u64, index);
+            const own = current >= first and current < first + 3;
+            shown[index] = .{
+                .display = known.display,
+                .space = if (index == which) space else if (own) current else first,
+            };
+        }
+        simulator.step(.{ .spaces_shown = shown[0..engine.monitors_count] });
     }
 
     fn action_open_some(simulator: *Simulator) void {
@@ -1530,6 +1564,13 @@ pub const Simulator = struct {
                 assert(engine.workspace_visible(known.workspace));
             }
             if (!known.managed() or engine.monitors_count == 0) continue;
+            // With native Spaces macOS hides the windows of a Space that does not show,
+            // and they are sent no frame.
+            const hidden = !engine.workspace_visible(known.workspace);
+            if (engine.config.spaces_native and hidden) {
+                assert(!known.desired_valid);
+                continue;
+            }
             assert(known.desired_valid);
             assert(!known.set_pending);
             if (known.frozen or window.stubborn) continue;
@@ -1648,7 +1689,7 @@ pub const Simulator = struct {
         // A tile that the gaps squeeze to nothing is still sent a frame one pixel wide,
         // and that pixel lies on its neighbour. The tiles of an accordion fill the
         // workspace whatever the hidden layout gives them.
-        if (simulator.engine.workspaces[known.workspace].accordion) {
+        if (simulator.engine.workspaces[known.workspace].tiling == .fullscreen) {
             return window.frame.eql(known.desired);
         }
         const forest = &simulator.engine.forest;
@@ -1670,7 +1711,8 @@ pub const Simulator = struct {
             assert(frame.x >= area.x and frame.right() <= area.right());
             assert(frame.y >= area.y and frame.bottom() <= area.bottom());
             // The tiles of an accordion are stacked: each one fills the workspace.
-            if (engine.workspaces[known.workspace].accordion) {
+            const tiling = engine.workspaces[known.workspace].tiling;
+            if (tiling == .fullscreen) {
                 const shown_on = engine.workspace_monitor(known.workspace);
                 assert(frame.eql(engine.workspace_rect(shown_on)));
                 simulator.coverage.stacked += 1;
@@ -1680,6 +1722,8 @@ pub const Simulator = struct {
                 const beside = engine.window_find(other.id) orelse continue;
                 if (beside.workspace != known.workspace) continue;
                 if (!simulator.tile_placed(other, beside)) continue;
+                // The tiles of one pane of two-pane lie exactly over each other.
+                if (tiling == .two_pane and frame.eql(other.frame)) continue;
                 if (frame.intersects(other.frame)) {
                     std.debug.print("seed {d}: tiles {d} and {d} overlap\n", .{
                         simulator.options.seed, window.id, other.id,
@@ -1845,8 +1889,21 @@ fn trace_step(
 
 /// One full simulation run. Returns the number of events delivered.
 pub fn run_seed(engine: *Engine, simulator: *Simulator, seed: u64, steps: u32, faults: bool) u64 {
+    return run_seed_with(engine, simulator, seed, steps, faults, false);
+}
+
+/// One full simulation run, with macOS Spaces as the workspaces when native.
+pub fn run_seed_with(
+    engine: *Engine,
+    simulator: *Simulator,
+    seed: u64,
+    steps: u32,
+    faults: bool,
+    native: bool,
+) u64 {
     var config: config_module.Config = undefined;
     config.load_default();
+    config.spaces_native = native;
     engine.init(&config);
     simulator.init(engine, .{ .seed = seed, .faults = faults });
     simulator.run(steps);
@@ -1877,4 +1934,11 @@ test "simulation: is deterministic" {
     const second = run_seed(&test_engine, &test_simulator, 7, 800, true);
     try std.testing.expectEqual(first, second);
     try std.testing.expectEqual(first_sets, test_simulator.frames_set);
+}
+
+test "simulation: native Spaces, with faults" {
+    var seed: u64 = 1;
+    while (seed <= 60) : (seed += 1) {
+        _ = run_seed_with(&test_engine, &test_simulator, seed, 600, true, true);
+    }
 }

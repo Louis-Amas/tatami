@@ -24,10 +24,15 @@ pub export fn main(argc: c_int, argv: [*][*:0]u8) c_int {
     var steps: u32 = 2000;
     var seeds: u32 = 1;
     var faults = true;
+    var native = false;
     var positional: u32 = 0;
     var index: usize = 1;
     while (index < @as(usize, @intCast(argc))) : (index += 1) {
         const arg = std.mem.span(argv[index]);
+        if (std.mem.eql(u8, arg, "--native-spaces")) {
+            native = true;
+            continue;
+        }
         if (std.mem.eql(u8, arg, "--no-faults")) {
             faults = false;
         } else if (std.mem.eql(u8, arg, "--trace")) {
@@ -51,7 +56,7 @@ pub export fn main(argc: c_int, argv: [*][*:0]u8) c_int {
         const current = seed + run;
         if (seeds > 1 and run % 100 == 0) std.debug.print("seed {d}...\n", .{current});
         sim.seed_running = current;
-        events += sim.run_seed(&engine, &simulator, current, steps, faults);
+        events += sim.run_seed_with(&engine, &simulator, current, steps, faults, native);
         frames += simulator.frames_set;
     }
     const elapsed_ms = (now_ns() - started) / std.time.ns_per_ms;

@@ -16,12 +16,14 @@ const geometry = @import("geometry.zig");
 const tree = @import("tree.zig");
 const command = @import("command.zig");
 const config_module = @import("config.zig");
+const layouts = @import("layouts.zig");
 
 const Rect = geometry.Rect;
 const Direction = geometry.Direction;
 const Command = command.Command;
 const WindowRef = command.WindowRef;
 const Config = config_module.Config;
+pub const Tiling = command.Tiling;
 const NodeIndex = tree.NodeIndex;
 const node_none = tree.node_none;
 
@@ -102,7 +104,12 @@ pub const WindowInfo = struct {
     /// The workspace on which the window manager that ran before this one left the
     /// window, when that is known. Only looked at for adopted windows.
     workspace: ?u8 = null,
+    /// The macOS Space the window is on, 0 when not known or not an ordinary Space.
+    space: u64 = 0,
 };
+
+/// The Space a display shows, for native Spaces.
+pub const SpaceShown = struct { display: u32, space: u64 };
 
 /// What the window manager that ran before this one knew about a workspace. None of it
 /// is trusted: the file it comes from may be old, cut short or about other displays.
@@ -118,8 +125,13 @@ pub const WorkspaceMemory = struct {
     recent: bool = false,
     /// Its gaps were toggled.
     gaps: bool = false,
-    /// Its tiles were stacked as an accordion.
-    accordion: bool = false,
+    /// Its layout, a command.Tiling as a number.
+    tiling: u8 = 0,
+    /// How many tiles its main pane holds and the main pane's share of it.
+    main_count: u8 = 1,
+    main_ratio: u32 = tree.ratio_half,
+    /// The macOS Space it stood for, 0 for none.
+    space: u64 = 0,
     label: command.Label = .{},
 };
 
@@ -181,6 +193,10 @@ pub const Event = union(enum) {
     window_minimized: struct { id: WindowId, minimized: bool },
     window_fullscreen: struct { id: WindowId, fullscreen: bool },
     window_tab_changed: struct { id: WindowId, tab_of: WindowId },
+    /// With native Spaces: the Space each display shows now.
+    spaces_shown: []const SpaceShown,
+    /// With native Spaces: the window is on another Space now.
+    window_space: struct { id: WindowId, space: u64 },
     /// The OS notified us that keyboard focus moved to this window.
     window_focused: WindowId,
     /// The answer to a query_focus effect: where keyboard focus is right now.
@@ -210,6 +226,10 @@ pub const Effect = union(enum) {
     exec: command.Span,
     /// Report the focused window again; the engine lost track of it.
     query_focus,
+    /// With native Spaces: show this Space, through Mission Control.
+    space_switch: command.Target,
+    /// With native Spaces: carry the window to this Space, through Mission Control.
+    space_send: struct { id: WindowId, pid: i32, target: command.Target },
     reload,
     quit,
 };
@@ -361,9 +381,20 @@ pub const Workspace = struct {
     /// The share of the split that the next window gets, with insert. 0 is an even split.
     insert_percent: u8 = 0,
     gaps_toggled: bool = false,
-    /// Every tile fills the workspace, stacked; focus and swap walk the stack in layout
-    /// order. The tree stays as it is underneath, so turning it off brings the tiles back.
-    accordion: bool = false,
+    /// How the tiles are arranged: by the tree, or by their order alone in one of
+    /// Amethyst's layouts. The tree stays as it is underneath whatever the layout, so
+    /// going back to bsp brings the tiles back where they were. In fullscreen (the
+    /// accordion) every tile fills the workspace, stacked; focus and swap walk the stack
+    /// in layout order.
+    tiling: Tiling = .bsp,
+    /// The layout that 'toggle accordion' goes back to.
+    tiling_back: Tiling = .bsp,
+    /// How many tiles the main pane of a layout holds, at least one.
+    main_count: u8 = 1,
+    /// The main pane's share of the workspace, out of tree.ratio_unit.
+    main_ratio: u32 = tree.ratio_half,
+    /// With native Spaces, the macOS Space this workspace stands for, 0 for none yet.
+    space: u64 = 0,
     label: command.Label = .{},
     /// The display change before which this workspace was last seen showing on a monitor,
     /// 0 for never. A display that comes back shows what it showed when it went away.
@@ -455,7 +486,9 @@ pub const Engine = struct {
         engine.forest.init();
         for (&engine.windows) |*window| window.* = .{};
         for (&engine.apps) |*app| app.* = .{};
-        for (&engine.workspaces) |*workspace| workspace.* = .{};
+        for (&engine.workspaces) |*workspace| {
+            workspace.* = .{ .tiling = config.layouts[0], .tiling_back = config.layouts[0] };
+        }
         engine.monitors_count = 0;
         engine.monitors_asleep = 0;
         engine.shown_seq = 0;
@@ -485,9 +518,18 @@ pub const Engine = struct {
     /// Swaps in a new configuration. Existing windows keep their mode; rules only apply to
     /// windows that appear from now on.
     pub fn config_replace(engine: *Engine, config: *const Config) void {
+        const old = engine.config.layouts[0..engine.config.layouts_count];
+        const new = config.layouts[0..config.layouts_count];
+        const cycle_changed = !std.mem.eql(Tiling, old, new);
         engine.config = config.*;
         for (&engine.windows) |*window| {
             if (window.id != 0) window.rules_applied = std.math.maxInt(u64);
+        }
+        // When the cycle changes, a layout that it now leaves out gives way to its first
+        // one. A layout chosen by name stays over a reload that keeps the cycle.
+        if (!cycle_changed) return;
+        for (&engine.workspaces) |*workspace| {
+            if (config.layout_index(workspace.tiling) == null) workspace.tiling = config.layouts[0];
         }
     }
 
@@ -519,6 +561,8 @@ pub const Engine = struct {
             .window_minimized => |e| engine.on_minimized(e.id, e.minimized),
             .window_fullscreen => |e| engine.on_fullscreen(e.id, e.fullscreen),
             .window_tab_changed => |e| engine.on_tab_changed(e.id, e.tab_of),
+            .spaces_shown => |list| engine.on_spaces_shown(list),
+            .window_space => |e| engine.on_window_space(e.id, e.space),
             .window_focused => |id| engine.focus_observe(id, false),
             .focus_reported => |id| engine.focus_observe(id, true),
             .command => |cmd| engine.on_command(cmd),
@@ -593,7 +637,9 @@ pub const Engine = struct {
         for (&engine.workspaces) |*workspace| {
             for (workspace.label.slice()) |byte| hash = hash_mix(hash, byte);
             hash = hash_mix(hash, 0xff);
-            hash = hash_mix(hash, @intFromBool(workspace.accordion));
+            hash = hash_mix(hash, @backingInt(workspace.tiling));
+            hash = hash_mix(hash, workspace.main_count);
+            hash = hash_mix(hash, workspace.main_ratio);
         }
         return hash_mix(hash, engine.focused_window);
     }
@@ -837,7 +883,18 @@ pub const Engine = struct {
             workspace.display = memory.display;
             workspace.shown_seq = if (memory.shown) engine.shown_seq else 0;
             workspace.gaps_toggled = memory.gaps;
-            workspace.accordion = memory.accordion;
+            if (memory.tiling < std.enums.values(Tiling).len) {
+                workspace.tiling = @fromBackingInt(@intCast(memory.tiling));
+            }
+            const count = memory.main_count;
+            workspace.main_count = std.math.clamp(count, 1, layouts.main_count_max);
+            const ratio = memory.main_ratio;
+            workspace.main_ratio = std.math.clamp(ratio, tree.ratio_min, tree.ratio_max);
+            // A Space stands for one workspace only, whatever the file says.
+            workspace.space = 0;
+            if (memory.space != 0 and engine.workspace_of_space_known(memory.space) == null) {
+                workspace.space = memory.space;
+            }
             workspace.label = label_checked(memory.label);
             if (memory.focused) current = memory.workspace;
             if (memory.recent) engine.recent_workspace = memory.workspace;
@@ -961,7 +1018,10 @@ pub const Engine = struct {
                 .focused = known.len > 0 and index == engine.workspace_current(),
                 .recent = index == engine.recent_workspace,
                 .gaps = workspace.gaps_toggled,
-                .accordion = workspace.accordion,
+                .tiling = @backingInt(workspace.tiling),
+                .main_count = workspace.main_count,
+                .main_ratio = workspace.main_ratio,
+                .space = workspace.space,
                 .label = workspace.label,
             };
         }
@@ -1480,6 +1540,7 @@ pub const Engine = struct {
             engine.window_place(window, info);
         }
         engine.membership_sync(window);
+        engine.space_follow(window, info.space);
         // The OS already said that the keyboard is on this window, before we knew it.
         if (engine.os_focus == info.id) engine.focus_stale = true;
         engine.note(.{ .window_created = info.id });
@@ -1949,6 +2010,110 @@ pub const Engine = struct {
         }
     }
 
+    // Native Spaces.
+
+    /// The workspace that stands for the Space, if one does.
+    fn workspace_of_space_known(engine: *const Engine, space: u64) ?u8 {
+        assert(space != 0);
+        for (&engine.workspaces, 0..) |*workspace, index| {
+            if (workspace.space == space) return @intCast(index);
+        }
+        return null;
+    }
+
+    /// The workspace that stands for the Space, given one on first sight: a workspace that
+    /// stands for no Space, has no windows and does not show. A Space that has gone away
+    /// leaves its workspace empty, and that one is taken next. With every workspace in use
+    /// the Space shares the one in use.
+    fn workspace_of_space(engine: *Engine, space: u64, display: u32) u8 {
+        if (engine.workspace_of_space_known(space)) |workspace| return workspace;
+        var pass: u32 = 0;
+        while (pass < 2) : (pass += 1) {
+            for (&engine.workspaces, 0..) |*workspace, index| {
+                const free = if (pass == 0) workspace.space == 0 else true;
+                if (!free or engine.workspace_shown_anywhere(@intCast(index))) continue;
+                if (!engine.workspace_empty(@intCast(index))) continue;
+                workspace.* = .{
+                    .tiling = engine.config.layouts[0],
+                    .tiling_back = engine.config.layouts[0],
+                    .space = space,
+                    .display = display,
+                };
+                return @intCast(index);
+            }
+        }
+        return engine.workspace_current();
+    }
+
+    /// Each display shows the workspace of the Space that macOS shows on it. The first
+    /// time, the workspace a display already shows becomes its Space's, so the windows
+    /// found at startup stay where they are.
+    fn on_spaces_shown(engine: *Engine, list: []const SpaceShown) void {
+        if (!engine.config.spaces_native or engine.monitors_count == 0) return;
+        for (list) |entry| {
+            if (entry.space == 0) continue;
+            const monitor = for (engine.monitors[0..engine.monitors_count], 0..) |*m, i| {
+                if (m.display == entry.display) break @as(u8, @intCast(i));
+            } else continue;
+            const shown = engine.monitors[monitor].workspace;
+            if (engine.workspace_of_space_known(entry.space) == null and
+                engine.workspaces[shown].space == 0)
+            {
+                engine.workspaces[shown].space = entry.space;
+            }
+            const workspace = engine.workspace_of_space(entry.space, entry.display);
+            if (workspace == shown) continue;
+            // The Space moved to this display, or shows on two: leave the other alone.
+            if (engine.workspace_shown_anywhere(workspace)) continue;
+            engine.workspaces[workspace].display = entry.display;
+            engine.workspace_show(workspace);
+        }
+        // The window with focus slid away with its Space: macOS gives focus to a window
+        // of the Space in view. The one it has focus on now is taken if it shows, else
+        // macOS is asked.
+        if (engine.focused()) |holder| {
+            // Its Space may now show on another display.
+            if (engine.workspace_visible(holder.workspace)) {
+                return engine.focused_monitor_follow(holder);
+            }
+            engine.focused_window = 0;
+        }
+        // A request of ours still on its way decides where focus ends up, not this.
+        if (engine.focus_pending_count > 0) return;
+        if (engine.window_find(engine.os_focus)) |os_window| {
+            const shows = engine.workspace_visible(os_window.workspace);
+            if (shows and os_window.focusable() and os_window.tab_of == 0) {
+                engine.focused_monitor_follow(os_window);
+                return engine.focus_state_set(os_window);
+            }
+        }
+        engine.focus_stale = true;
+    }
+
+    fn on_window_space(engine: *Engine, id: WindowId, space: u64) void {
+        const window = engine.window_find(id) orelse return;
+        engine.space_follow(window, space);
+    }
+
+    /// A window joins the workspace of the Space that macOS says it is on.
+    fn space_follow(engine: *Engine, window: *Window, space: u64) void {
+        if (!engine.config.spaces_native or space == 0 or engine.monitors_count == 0) return;
+        if (window.tab_of != 0) return;
+        const monitor = engine.monitor_at(window.actual.center_x(), window.actual.center_y()) orelse
+            engine.focused_monitor;
+        const workspace = engine.workspace_of_space(space, engine.monitors[monitor].display);
+        if (workspace == window.workspace) return;
+        window.sticky = false;
+        const origin = window.workspace;
+        engine.window_move(window, workspace);
+        if (engine.focused_window != window.id) return;
+        if (engine.workspace_visible(workspace)) return engine.focused_monitor_follow(window);
+        // Gone to a Space that does not show: focus stays with the Space in view, until
+        // macOS slides over and says where focus is.
+        engine.focused_window = 0;
+        engine.focus_after_loss(origin, 0);
+    }
+
     fn on_title_changed(engine: *Engine, id: WindowId, title: []const u8) void {
         const window = engine.window_find(id) orelse return;
         var before: [title_max]u8 = undefined;
@@ -2253,6 +2418,7 @@ pub const Engine = struct {
             }
             return;
         }
+        if (engine.by_order(window.workspace)) return engine.main_drag(window, frame);
         const gap = engine.gap_inner(window.workspace);
         const forest = &engine.forest;
         if (frame.x != old.x) _ = forest.resize_edge(leaf, .west, frame.x - old.x, gap);
@@ -2263,6 +2429,69 @@ pub const Engine = struct {
         if (frame.bottom() != old.bottom()) {
             _ = forest.resize_edge(leaf, .south, frame.bottom() - old.bottom(), gap);
         }
+    }
+
+    /// A tile of a layout with a main pane was resized with the mouse: the main pane takes
+    /// the size that gives the window the extent it was dragged to. A tile of the main pane
+    /// sets it directly; any other tile sets what is left of it. Layouts without a main
+    /// pane put the window back.
+    fn main_drag(engine: *Engine, window: *Window, frame: Rect) void {
+        const workspace = &engine.workspaces[window.workspace];
+        if (!workspace.tiling.has_main()) return;
+        const old = window.desired;
+        const area = engine.workspace_rect(engine.workspace_monitor(window.workspace));
+        const axis = layouts.main_axis(workspace.tiling, area);
+        const before = if (axis == .x) old.w else old.h;
+        const after = if (axis == .x) frame.w else frame.h;
+        engine.main_grow(window, after - before);
+    }
+
+    /// Grows the window's pane by pixels along the main axis, taking it from the others.
+    fn main_grow(engine: *Engine, window: *Window, pixels: i32) void {
+        assert(window.in_layout());
+        const workspace = &engine.workspaces[window.workspace];
+        if (!workspace.tiling.has_main() or pixels == 0) return;
+        const area = engine.workspace_rect(engine.workspace_monitor(window.workspace));
+        const gap = engine.gap_inner(window.workspace);
+        const extent = engine.main_extent(window.workspace);
+        // The other panes of three columns share what the main one leaves: growing one of
+        // them by a pixel takes two from the main pane.
+        const sides: i32 = @intCast(layouts.side_panes(workspace.tiling));
+        const in_main = engine.tile_index(window) < workspace.main_count;
+        const delta = if (in_main) pixels else -sides * pixels;
+        workspace.main_ratio = layouts.main_ratio_from(
+            workspace.tiling,
+            area,
+            gap,
+            extent + delta,
+        );
+    }
+
+    /// The extent of the main pane along the main axis, as the ratio lays it out.
+    fn main_extent(engine: *const Engine, workspace_index: u8) i32 {
+        const workspace = &engine.workspaces[workspace_index];
+        const area = engine.workspace_rect(engine.workspace_monitor(workspace_index));
+        const axis = layouts.main_axis(workspace.tiling, area);
+        const sides: i64 = layouts.side_panes(workspace.tiling);
+        const gaps: i64 = @as(i64, engine.gap_inner(workspace_index)) * sides;
+        const total: i64 = if (axis == .x) area.w else area.h;
+        const usable: i64 = @max(0, total - gaps);
+        return @intCast((usable * workspace.main_ratio + tree.ratio_half) >> 16);
+    }
+
+    /// The place of a tile in the layout order of its workspace, counting from 0.
+    fn tile_index(engine: *const Engine, window: *const Window) u32 {
+        assert(window.in_layout());
+        const forest = &engine.forest;
+        const root = engine.workspaces[window.workspace].root;
+        var index: u32 = 0;
+        var leaf = forest.leaf_first(root);
+        while (leaf != node_none) : (leaf = forest.leaf_next(root, leaf)) {
+            assert(index < windows_max);
+            if (forest.nodes[leaf].window == window.id) return index;
+            index += 1;
+        }
+        unreachable;
     }
 
     /// A tile dropped where no other tile is. On another monitor, whose workspace has no
@@ -2405,6 +2634,8 @@ pub const Engine = struct {
         const monitor_index = engine.workspace_monitor(window.workspace);
         const monitor = &engine.monitors[monitor_index];
         if (monitor.workspace != window.workspace) {
+            // macOS hides the windows of a Space that does not show; they stay as they are.
+            if (engine.config.spaces_native) return null;
             return rect_sized(engine.park_rect(monitor_index, window));
         }
         const area = engine.workspace_rect(monitor_index);
@@ -2414,7 +2645,8 @@ pub const Engine = struct {
         assert(leaf != node_none);
         if (engine.stacked(window)) return tile_sized(area, area);
         const node = &engine.forest.nodes[leaf];
-        if (window.zoom == .parent and node.parent != node_none) {
+        const tree_zoom = !engine.by_order(window.workspace);
+        if (window.zoom == .parent and node.parent != node_none and tree_zoom) {
             return tile_sized(engine.forest.nodes[node.parent].rect, area);
         }
         return tile_sized(node.rect, area);
@@ -2423,7 +2655,20 @@ pub const Engine = struct {
     /// A tile of an accordion: it fills the workspace, and has an order but no place or
     /// size of its own.
     fn stacked(engine: *const Engine, window: *const Window) bool {
-        return window.in_layout() and engine.workspaces[window.workspace].accordion;
+        return window.in_layout() and engine.workspaces[window.workspace].tiling == .fullscreen;
+    }
+
+    /// The tiles of the workspace are placed by one of Amethyst's layouts, not by the tree.
+    fn by_order(engine: *const Engine, workspace: u8) bool {
+        return engine.workspaces[workspace].tiling != .bsp;
+    }
+
+    /// The leaves of the workspace have the cells of a layout over those of the tree. Not
+    /// in fullscreen: there every tile is the whole area, and the leaves keep the hidden
+    /// tree, as an accordion always has.
+    fn cells_by_order(engine: *const Engine, workspace: u8) bool {
+        const tiling = engine.workspaces[workspace].tiling;
+        return tiling != .bsp and tiling != .fullscreen;
     }
 
     fn rect_sized(rect: Rect) Rect {
@@ -2450,6 +2695,9 @@ pub const Engine = struct {
             const root = engine.workspaces[monitor.workspace].root;
             const area = engine.workspace_rect(@intCast(index));
             engine.forest.layout(root, area, engine.gap_inner(monitor.workspace));
+            if (engine.cells_by_order(monitor.workspace)) {
+                engine.arrange_by_order(monitor.workspace, area);
+            }
         }
         // Windows coming on screen go first; that is the latency the user sees.
         for ([2]bool{ true, false }) |visible_pass| {
@@ -2459,6 +2707,28 @@ pub const Engine = struct {
                 engine.arrange_window(window);
             }
         }
+    }
+
+    /// Gives every leaf of the workspace the cell that its layout has for its place in
+    /// the layout order, over what the tree gave it. Everything that reads a tile's place
+    /// (targets, directions, drops) then sees the layout. One pass over the tiles.
+    fn arrange_by_order(engine: *Engine, workspace_index: u8, area: Rect) void {
+        const workspace = &engine.workspaces[workspace_index];
+        assert(workspace.tiling != .bsp);
+        const forest = &engine.forest;
+        var leaves: [windows_max]NodeIndex = undefined;
+        var count: u32 = 0;
+        var leaf = forest.leaf_first(workspace.root);
+        while (leaf != node_none) : (leaf = forest.leaf_next(workspace.root, leaf)) {
+            assert(count < windows_max);
+            leaves[count] = leaf;
+            count += 1;
+        }
+        var rects: [windows_max]Rect = undefined;
+        const gap = engine.gap_inner(workspace_index);
+        const main = workspace.main_count;
+        layouts.arrange(workspace.tiling, area, gap, main, workspace.main_ratio, rects[0..count]);
+        for (leaves[0..count], rects[0..count]) |index, rect| forest.nodes[index].rect = rect;
     }
 
     /// With every display asleep nothing is placed. A window that left our care in the
@@ -2522,7 +2792,11 @@ pub const Engine = struct {
                 const edge: Direction = if (resize.dimension == .width) .east else .south;
                 engine.command_resize(edge, resize.delta);
             },
-            .balance => engine.forest.balance(engine.workspaces[engine.workspace_current()].root),
+            .balance => {
+                const workspace = &engine.workspaces[engine.workspace_current()];
+                engine.forest.balance(workspace.root);
+                workspace.main_ratio = tree.ratio_half;
+            },
             .retile => engine.command_retile(),
             .rotate => |degrees| {
                 engine.forest.rotate(engine.workspaces[engine.workspace_current()].root, degrees);
@@ -2534,10 +2808,20 @@ pub const Engine = struct {
             },
             .toggle => |what| engine.command_toggle(what),
             .workspace => |target| {
+                if (engine.config.spaces_native) return engine.emit(.{ .space_switch = target });
                 if (engine.workspace_resolve(target)) |workspace| engine.workspace_focus(workspace);
             },
             .send => |move| {
                 const window = engine.focused() orelse return;
+                if (engine.config.spaces_native) {
+                    // macOS moves it; where it lands comes back as window_space.
+                    if (window.tab_of != 0 or !window.managed()) return;
+                    return engine.emit(.{ .space_send = .{
+                        .id = window.id,
+                        .pid = window.pid,
+                        .target = move.target,
+                    } });
+                }
                 const workspace = engine.workspace_resolve(move.target) orelse return;
                 engine.window_send(window, workspace, move.follow);
             },
@@ -2559,6 +2843,8 @@ pub const Engine = struct {
                 engine.float_settle(window);
             },
             .layout => |layout| engine.command_layout(layout),
+            .main => |what| engine.command_main(what),
+            .swap_cycle => |forward| engine.command_swap_cycle(forward),
             .close => {
                 const window = engine.focused() orelse return;
                 engine.emit(.{ .close_window = .{ .id = window.id, .pid = window.pid } });
@@ -2584,6 +2870,19 @@ pub const Engine = struct {
                 const window = engine.focused() orelse return true;
                 if (!window.in_layout() or window.zoom != .none) return true;
                 if (engine.stacked(window)) return true;
+                if (engine.by_order(window.workspace)) {
+                    // The share of the window's pane: of the main pane, or of the rest.
+                    const workspace = &engine.workspaces[window.workspace];
+                    if (!workspace.tiling.has_main()) return true;
+                    const in_main = engine.tile_index(window) < workspace.main_count;
+                    const share: u32 = if (in_main) percent else 100 - @as(u32, percent);
+                    workspace.main_ratio = std.math.clamp(
+                        tree.ratio_unit * share / 100,
+                        tree.ratio_min,
+                        tree.ratio_max,
+                    );
+                    return true;
+                }
                 engine.forest.share_set(engine.forest.leaf_find(window.id), percent);
             },
             .zoom => |zoom| engine.command_zoom(zoom.window, zoom.state),
@@ -2992,6 +3291,15 @@ pub const Engine = struct {
     fn command_resize(engine: *Engine, edge: Direction, delta: i32) void {
         const window = engine.focused() orelse return;
         if (!window.in_layout() or window.zoom != .none or engine.stacked(window)) return;
+        if (engine.by_order(window.workspace)) {
+            // An edge along the main axis grows the window's pane: east and south by delta,
+            // west and north by its opposite, as the edge moves away from the window.
+            const workspace = &engine.workspaces[window.workspace];
+            const area = engine.workspace_rect(engine.workspace_monitor(window.workspace));
+            if (edge.axis() != layouts.main_axis(workspace.tiling, area)) return;
+            const clamped = std.math.clamp(delta, -nudge_max, nudge_max);
+            return engine.main_grow(window, if (edge.is_leading()) -clamped else clamped);
+        }
         const leaf = engine.forest.leaf_find(window.id);
         const gap = engine.gap_inner(window.workspace);
         if (engine.forest.resize_edge(leaf, edge, delta, gap)) return;
@@ -3232,7 +3540,16 @@ pub const Engine = struct {
         if (what == .gaps or what == .accordion) {
             const workspace = &engine.workspaces[engine.workspace_current()];
             if (what == .gaps) workspace.gaps_toggled = !workspace.gaps_toggled;
-            if (what == .accordion) workspace.accordion = !workspace.accordion;
+            if (what == .accordion) {
+                if (workspace.tiling == .fullscreen) {
+                    workspace.tiling = workspace.tiling_back;
+                    // Back from an accordion that the cycle or a layout command made.
+                    if (workspace.tiling == .fullscreen) workspace.tiling = .bsp;
+                } else {
+                    workspace.tiling_back = workspace.tiling;
+                    workspace.tiling = .fullscreen;
+                }
+            }
             return;
         }
         const window = engine.focused() orelse return;
@@ -3275,18 +3592,104 @@ pub const Engine = struct {
         window.float_rect = area.grid(grid.rows, grid.cols, grid.x, grid.y, grid.w, grid.h);
     }
 
+    /// 'layout float' floats the whole workspace and a layout's name tiles it all in that
+    /// layout, as Amethyst's floating layout and its others do. 'layout next' and 'layout
+    /// prev' only change how the tiles are arranged.
     fn command_layout(engine: *Engine, layout: command.Layout) void {
-        const workspace = engine.workspace_current();
+        const workspace_index = engine.workspace_current();
+        const workspace = &engine.workspaces[workspace_index];
+        switch (layout) {
+            .cycle => |forward| {
+                const cycle = engine.config.layouts[0..engine.config.layouts_count];
+                assert(cycle.len > 0);
+                const at = engine.config.layout_index(workspace.tiling);
+                const next: usize = if (at) |index|
+                    (if (forward) index + 1 else index + cycle.len - 1) % cycle.len
+                else if (forward) 0 else cycle.len - 1;
+                workspace.tiling = cycle[next];
+                return;
+            },
+            .tiling => |tiling| workspace.tiling = tiling,
+            .float => {},
+        }
         for (&engine.windows) |*window| {
-            if (window.id == 0 or window.workspace != workspace or !window.managed()) continue;
+            if (window.id == 0 or window.workspace != workspace_index) continue;
+            if (!window.managed()) continue;
             switch (layout) {
                 .float => engine.mode_set(window, .floating),
-                .bsp => {
+                .tiling => {
                     const tiles = window.kind == .standard and window.resizable and !window.sticky;
                     if (tiles) engine.mode_set(window, .tiled);
                 },
+                .cycle => unreachable,
             }
         }
+    }
+
+    /// The tile at a place in the layout order of the workspace, or null past the last.
+    fn tile_at(engine: *Engine, workspace_index: u8, index: u32) ?*Window {
+        const forest = &engine.forest;
+        const root = engine.workspaces[workspace_index].root;
+        var at: u32 = 0;
+        var leaf = forest.leaf_first(root);
+        while (leaf != node_none) : (leaf = forest.leaf_next(root, leaf)) {
+            assert(at < windows_max);
+            if (at == index) return engine.window_find(forest.nodes[leaf].window).?;
+            at += 1;
+        }
+        return null;
+    }
+
+    fn command_main(engine: *Engine, what: command.Main) void {
+        const workspace_index = engine.workspace_current();
+        const workspace = &engine.workspaces[workspace_index];
+        switch (what) {
+            .expand, .shrink => {
+                const change: i64 = layouts.ratio_step;
+                const signed = if (what == .expand) change else -change;
+                const ratio = std.math.clamp(
+                    workspace.main_ratio + signed,
+                    tree.ratio_min,
+                    tree.ratio_max,
+                );
+                workspace.main_ratio = @intCast(ratio);
+            },
+            .more => workspace.main_count = @min(workspace.main_count + 1, layouts.main_count_max),
+            .fewer => workspace.main_count = @max(workspace.main_count - 1, 1),
+            .focus => {
+                const main = engine.tile_at(workspace_index, 0) orelse return;
+                engine.focus_request(main);
+            },
+            .swap => {
+                // The focused tile trades places with the first one; the first one, which
+                // is already there, with the one after it. Focus stays with the window.
+                const window = engine.focused() orelse return;
+                if (!window.in_layout()) return;
+                const first = engine.tile_at(window.workspace, 0) orelse return;
+                const other = if (first == window)
+                    engine.tile_at(window.workspace, 1) orelse return
+                else
+                    first;
+                const forest = &engine.forest;
+                forest.swap_windows(forest.leaf_find(window.id), forest.leaf_find(other.id));
+            },
+        }
+    }
+
+    /// The focused tile trades places with the next or the previous one in layout order,
+    /// from the last to the first and back around, as Amethyst's swap clockwise does.
+    fn command_swap_cycle(engine: *Engine, forward: bool) void {
+        const window = engine.focused() orelse return;
+        if (!window.in_layout()) return;
+        const forest = &engine.forest;
+        const root = engine.workspaces[window.workspace].root;
+        const leaf = forest.leaf_find(window.id);
+        var other = if (forward) forest.leaf_next(root, leaf) else forest.leaf_prev(root, leaf);
+        if (other == node_none) {
+            other = if (forward) forest.leaf_first(root) else forest.leaf_last(root);
+        }
+        if (other == leaf) return;
+        forest.swap_windows(leaf, other);
     }
 
     fn command_close_others(engine: *Engine) void {
@@ -3559,9 +3962,12 @@ pub const Engine = struct {
                 text.print("{{\"index\":{d},\"focused\":{s},\"visible\":{s},\"monitor\":{d}", .{
                     workspace + 1, bool_name(current), bool_name(visible), monitor,
                 });
-                text.print(",\"windows\":{d},\"accordion\":{s},\"label\":", .{
-                    count, bool_name(engine.workspaces[workspace].accordion),
+                const tiling = engine.workspaces[workspace].tiling;
+                text.print(",\"windows\":{d},\"accordion\":{s},", .{
+                    count, bool_name(tiling == .fullscreen),
                 });
+                engine.tiling_json(text, workspace);
+                text.append(",\"label\":");
                 text.json_string(label);
                 text.append("}");
             } else {
@@ -3569,10 +3975,11 @@ pub const Engine = struct {
                 const shown = if (visible) "visible" else "hidden";
                 const name = if (label.len > 0) label else "-";
                 // After the label, so that the columns before it stay where they were.
-                const accordion = if (engine.workspaces[workspace].accordion) "\taccordion" else "";
-                text.print("{c}{d}\tmonitor={d}\t{s}\twindows={d}\t{s}{s}\n", .{
-                    mark, workspace + 1, monitor, shown, count, name, accordion,
+                text.print("{c}{d}\tmonitor={d}\t{s}\twindows={d}\t{s}", .{
+                    mark, workspace + 1, monitor, shown, count, name,
                 });
+                engine.tiling_words(text, workspace, '\t');
+                text.append("\n");
             }
             listed += 1;
         }
@@ -3675,15 +4082,38 @@ pub const Engine = struct {
         return window.mode == .floating and window.managed();
     }
 
+    /// After the columns that were there before layouts: nothing for the tree, accordion
+    /// for fullscreen (its older name), and a layout with a main pane with the pane's count
+    /// and share.
+    fn tiling_words(engine: *const Engine, text: *stdx.Text, workspace_index: u8, gap: u8) void {
+        const workspace = &engine.workspaces[workspace_index];
+        switch (workspace.tiling) {
+            .bsp => {},
+            .fullscreen => text.print("{c}accordion", .{gap}),
+            else => |tiling| {
+                const percent = (workspace.main_ratio * 100 + tree.ratio_half) / tree.ratio_unit;
+                text.print("{c}{s}{c}main={d}{c}{d}%", .{
+                    gap, tiling.name(), gap, workspace.main_count, gap, percent,
+                });
+            },
+        }
+    }
+
+    fn tiling_json(engine: *const Engine, text: *stdx.Text, workspace_index: u8) void {
+        const workspace = &engine.workspaces[workspace_index];
+        const percent = (workspace.main_ratio * 100 + tree.ratio_half) / tree.ratio_unit;
+        text.print("\"tiling\":\"{s}\",\"main_count\":{d},\"main_percent\":{d}", .{
+            workspace.tiling.name(), workspace.main_count, percent,
+        });
+    }
+
     fn tree_lines(engine: *Engine, text: *stdx.Text, workspace: u8) void {
         const forest = &engine.forest;
         const root = engine.workspaces[workspace].root;
         const visible = engine.workspace_visible(workspace);
-        text.print("workspace {d} {s}{s}\n", .{
-            workspace + 1,
-            if (visible) "visible" else "hidden",
-            if (engine.workspaces[workspace].accordion) " accordion" else "",
-        });
+        text.print("workspace {d} {s}", .{ workspace + 1, if (visible) "visible" else "hidden" });
+        engine.tiling_words(text, workspace, ' ');
+        text.append("\n");
         var index = root;
         var steps: u32 = 0;
         while (index != node_none) : (index = forest.next(root, index)) {
@@ -3710,7 +4140,9 @@ pub const Engine = struct {
         text.print("{{\"index\":{d},\"visible\":{s}", .{ workspace + 1, bool_name(visible) });
         text.append(",\"label\":");
         text.json_string(engine.workspaces[workspace].label.slice());
-        text.print(",\"accordion\":{s}", .{bool_name(engine.workspaces[workspace].accordion)});
+        const tiling = engine.workspaces[workspace].tiling;
+        text.print(",\"accordion\":{s},", .{bool_name(tiling == .fullscreen)});
+        engine.tiling_json(text, workspace);
         text.append(",\"layout\":");
         engine.layout_json(text, engine.workspaces[workspace].root);
         text.append(",\"floating\":[");
@@ -3816,7 +4248,8 @@ pub const Engine = struct {
                 assert(other.workspace != monitor.workspace);
                 assert(other.display != monitor.display);
             }
-            // The tiles of a visible workspace partition its area exactly.
+            // The tiles of a visible workspace partition its area exactly, unless a layout
+            // of Amethyst's stacks them or leaves a column empty.
             const root = engine.workspaces[monitor.workspace].root;
             const area = engine.workspace_rect(@intCast(index));
             var covered: i64 = 0;
@@ -3827,7 +4260,8 @@ pub const Engine = struct {
                 assert(rect.right() <= area.right() and rect.bottom() <= area.bottom());
                 covered += rect.area();
             }
-            if (root != node_none and engine.gap_inner(monitor.workspace) == 0) {
+            const exact = !engine.cells_by_order(monitor.workspace);
+            if (root != node_none and engine.gap_inner(monitor.workspace) == 0 and exact) {
                 assert(covered == area.area());
             }
         }

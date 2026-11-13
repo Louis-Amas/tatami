@@ -38,6 +38,27 @@ an accordion: every tile at full size, the tree kept as it is underneath. A stac
 then has an order and no place or size of its own, so directions step along the stack and
 the mouse and resize leave the tree alone.
 
+A workspace can also be laid out by one of Amethyst's layouts (`layouts.zig`, pure integer
+arithmetic, one pass over the tiles). The tree then serves as the order of the tiles: after
+the tree has given every node its rect, the layout gives each leaf, in tree order, the cell
+of its place, over what the tree gave it. Everything else that reads a tile's place (its
+target frame, directions, drops of the mouse) reads the leaf and so sees the layout, and
+nothing about the tree changes, so `layout bsp` brings it back. Each workspace keeps its
+layout, main pane count and main pane share; with a workspace per display, each display is
+laid out on its own. The simulator draws every layout and main pane command into its
+workload and checks the same invariants, except that the tiles of one pane of `two-pane`
+lie over each other, and a layout may leave a column empty, as Amethyst's three columns do.
+
+With `spaces native` a workspace stands for a macOS Space. The shell reads which Space each
+display shows (`src/macos/spaces.zig`, SkyLight looked up at runtime) and which Space each
+window is on, and tells the engine with `spaces_shown` and `window_space`. The engine gives
+a Space a workspace on first sight, shows on each display the workspace of its Space, and
+sends no frame to a window of a Space that does not show: macOS hides it, and parking it
+would drag it across the screen. `workspace` and `send` become effects that the shell
+carries out through Mission Control. The simulator plays Spaces too (`tatami-sim
+--native-spaces`): displays that slide to another of their Spaces and windows moved
+between them, under the same faults and invariants.
+
 The rules that make it behave:
 
 | Rule | Value |

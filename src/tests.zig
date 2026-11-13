@@ -3,6 +3,7 @@ test {
     _ = @import("stdx.zig");
     _ = @import("geometry.zig");
     _ = @import("tree.zig");
+    _ = @import("layouts.zig");
     _ = @import("command.zig");
     _ = @import("config.zig");
     _ = @import("engine.zig");
@@ -17,4 +18,5 @@ test {
     _ = @import("scenarios_review.zig");
     _ = @import("scenarios_hostile.zig");
     _ = @import("scenarios_restart.zig");
+    _ = @import("scenarios_amethyst.zig");
 }

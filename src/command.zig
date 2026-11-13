@@ -89,7 +89,66 @@ pub const QueryRequest = struct {
 pub const Toggle = enum { split, float, zoom_parent, zoom_fullscreen, sticky, gaps, accordion };
 pub const MirrorAxis = enum { x_axis, y_axis };
 pub const Dimension = enum { width, height };
-pub const Layout = enum { bsp, float };
+/// How a workspace arranges its tiles. bsp is the tree; the others are Amethyst's layouts,
+/// which place the tiles by their order alone and leave the tree underneath as it is.
+pub const Tiling = enum(u8) {
+    bsp,
+    tall,
+    tall_right,
+    wide,
+    two_pane,
+    three_column_left,
+    three_column_middle,
+    three_column_right,
+    widescreen_tall,
+    column,
+    row,
+    fullscreen,
+
+    pub fn name(tiling: Tiling) []const u8 {
+        return switch (tiling) {
+            .bsp => "bsp",
+            .tall => "tall",
+            .tall_right => "tall-right",
+            .wide => "wide",
+            .two_pane => "two-pane",
+            .three_column_left => "3column-left",
+            .three_column_middle => "3column-middle",
+            .three_column_right => "3column-right",
+            .widescreen_tall => "widescreen-tall",
+            .column => "column",
+            .row => "row",
+            .fullscreen => "fullscreen",
+        };
+    }
+
+    /// The layout of that name. middle-wide is what Amethyst called 3column-middle before.
+    pub fn parse(word: []const u8) ?Tiling {
+        if (std.mem.eql(u8, word, "middle-wide")) return .three_column_middle;
+        for (std.enums.values(Tiling)) |tiling| {
+            if (std.mem.eql(u8, tiling.name(), word)) return tiling;
+        }
+        return null;
+    }
+
+    /// The layouts with a main pane, whose size and count the main commands change.
+    pub fn has_main(tiling: Tiling) bool {
+        return tiling != .bsp and tiling != .fullscreen;
+    }
+};
+
+pub const Layout = union(enum) {
+    /// Float every window of the workspace.
+    float,
+    /// Tile every window of the workspace, arranged this way.
+    tiling: Tiling,
+    /// The next or the previous layout of the configured cycle; floating windows stay.
+    cycle: bool,
+};
+
+/// Amethyst's main pane: grow or shrink it, give it one window more or fewer, swap the
+/// focused window into it, or focus it.
+pub const Main = enum { expand, shrink, more, fewer, swap, focus };
 pub const Query = enum {
     windows,
     workspaces,
@@ -118,6 +177,9 @@ pub const Command = union(enum) {
     focus_window: WindowRef,
     swap: Direction,
     swap_windows: struct { a: WindowRef, b: WindowRef },
+    /// Trade places with the next or the previous tile in layout order, going around.
+    swap_cycle: bool,
+    main: Main,
     warp: Direction,
     move: MoveBeside,
     insert: Direction,
@@ -469,7 +531,10 @@ fn parse_focus(words: *Words) ParseError!Command {
 fn parse_swap(words: *Words) ParseError!Command {
     if (words.count < 2) return error.MissingArgument;
     if (words.count == 2) {
-        return .{ .swap = parse_direction(words.items[1]) orelse return error.BadArgument };
+        const word = words.items[1];
+        if (std.mem.eql(u8, word, "next")) return .{ .swap_cycle = true };
+        if (std.mem.eql(u8, word, "prev")) return .{ .swap_cycle = false };
+        return .{ .swap = parse_direction(word) orelse return error.BadArgument };
     }
     try expect_count(words, 3);
     return .{ .swap_windows = .{
@@ -601,6 +666,7 @@ fn parse_compound(name: []const u8, words: *const Words) ParseError!Command {
         grid,
         @"move-floating",
         layout,
+        main,
     };
     const kind = std.meta.stringToEnum(Kind, name) orelse return error.UnknownCommand;
     switch (kind) {
@@ -641,9 +707,20 @@ fn parse_compound(name: []const u8, words: *const Words) ParseError!Command {
         },
         .layout => {
             try expect_count(words, 2);
-            return .{ .layout = try parse_enum(Layout, words.items[1]) };
+            return .{ .layout = try parse_layout(words.items[1]) };
+        },
+        .main => {
+            try expect_count(words, 2);
+            return .{ .main = try parse_enum(Main, words.items[1]) };
         },
     }
+}
+
+fn parse_layout(word: []const u8) ParseError!Layout {
+    if (std.mem.eql(u8, word, "float")) return .float;
+    if (std.mem.eql(u8, word, "next")) return .{ .cycle = true };
+    if (std.mem.eql(u8, word, "prev")) return .{ .cycle = false };
+    return .{ .tiling = Tiling.parse(word) orelse return error.BadArgument };
 }
 
 fn parse_resize(words: *const Words) ParseError!Command {
@@ -680,6 +757,7 @@ pub const reference = [_]Entry{
     .{ .syntax = "focus <window>", .summary = "focus a window, showing its workspace" },
     .{ .syntax = "swap <direction>", .summary = "trade places with the neighbour that way" },
     .{ .syntax = "swap <window> <window>", .summary = "two windows trade places" },
+    .{ .syntax = "swap next|prev", .summary = "trade places along the layout order" },
     .{ .syntax = "warp <direction>", .summary = "re-insert the window beside its neighbour" },
     .{
         .syntax = "move [<window>] <direction> <anchor> [--ratio <percent>]",
@@ -708,7 +786,16 @@ pub const reference = [_]Entry{
     .{ .syntax = "tile [<window>]", .summary = "put a window back in the layout" },
     .{ .syntax = "grid rows:cols:x:y:w:h", .summary = "place a floating window on a grid" },
     .{ .syntax = "move-floating <dx> <dy>", .summary = "nudge a floating window" },
-    .{ .syntax = "layout bsp|float", .summary = "tile or float the whole workspace" },
+    .{
+        .syntax = "layout bsp|tall|tall-right|wide|two-pane|3column-left|3column-middle|" ++
+            "3column-right|widescreen-tall|column|row|fullscreen|float",
+        .summary = "tile the whole workspace that way, or float it",
+    },
+    .{ .syntax = "layout next|prev", .summary = "the next layout of the cycle" },
+    .{
+        .syntax = "main expand|shrink|more|fewer|swap|focus",
+        .summary = "the main pane: its size, its count, swap into it, focus it",
+    },
     .{ .syntax = "close [<window>]", .summary = "close a window" },
     .{ .syntax = "close-others", .summary = "close every other window of the workspace" },
     .{ .syntax = "label [<window>] <name>|--clear", .summary = "name a window" },
@@ -925,4 +1012,32 @@ test "a label is none of the words with a meaning, in capitals or not" {
     var pool: StringPool = .{};
     try testing.expectError(error.BadArgument, parse("label Below", &pool));
     try testing.expectError(error.BadArgument, parse("workspace Recent", &pool));
+}
+
+test "parse amethyst layouts and the main pane" {
+    var pool: StringPool = .{};
+    const tall: Command = .{ .layout = .{ .tiling = .tall } };
+    try testing.expectEqual(tall, try parse("layout tall", &pool));
+    try testing.expectEqual(
+        Command{ .layout = .{ .tiling = .three_column_middle } },
+        try parse("layout middle-wide", &pool),
+    );
+    const bsp: Command = .{ .layout = .{ .tiling = .bsp } };
+    try testing.expectEqual(bsp, try parse("layout bsp", &pool));
+    try testing.expectEqual(Command{ .layout = .float }, try parse("layout float", &pool));
+    const next: Command = .{ .layout = .{ .cycle = true } };
+    try testing.expectEqual(next, try parse("layout next", &pool));
+    const prev: Command = .{ .layout = .{ .cycle = false } };
+    try testing.expectEqual(prev, try parse("layout prev", &pool));
+    try testing.expectEqual(Command{ .main = .expand }, try parse("main expand", &pool));
+    try testing.expectEqual(Command{ .main = .fewer }, try parse("main fewer", &pool));
+    try testing.expectEqual(Command{ .swap_cycle = true }, try parse("swap next", &pool));
+    try testing.expectEqual(Command{ .swap_cycle = false }, try parse("swap prev", &pool));
+    try testing.expectError(error.BadArgument, parse("layout tower", &pool));
+    try testing.expectError(error.BadArgument, parse("main bigger", &pool));
+    try testing.expectError(error.MissingArgument, parse("main", &pool));
+    for (std.enums.values(Tiling)) |tiling| {
+        const parsed = try parse_layout(tiling.name());
+        try testing.expectEqual(Layout{ .tiling = tiling }, parsed);
+    }
 }

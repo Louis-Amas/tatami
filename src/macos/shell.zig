@@ -8,6 +8,7 @@ const c = @import("c.zig");
 const ax = @import("ax.zig");
 const ipc = @import("ipc.zig");
 const border = @import("border.zig");
+const spaces = @import("spaces.zig");
 const stdx = @import("../stdx.zig");
 const geometry = @import("../geometry.zig");
 const command = @import("../command.zig");
@@ -81,6 +82,8 @@ const ShellWindow = struct {
     element: Ref = null,
     /// Moved while a mouse button was down; reported once the button is released.
     dragging: bool = false,
+    /// With native Spaces, the desktop Space it was last seen on, 0 when not known.
+    space: u64 = 0,
 };
 
 /// Events that an effect leads to. They carry no slices, so they can wait in a queue while
@@ -135,6 +138,14 @@ var config_scratch: Config = undefined;
 var config_bytes: [config_bytes_max]u8 = undefined;
 var own_pid: i32 = 0;
 var border_reorder_at_ms: u64 = 0;
+/// Native Spaces: on when the configuration asks for them and SkyLight has the calls.
+var spaces_on: bool = false;
+var spaces_seen: spaces.Snapshot = .{};
+var spaces_poll_at_ms: u64 = 0;
+/// How often the Space each display shows is looked at. macOS tells AppKit applications
+/// when the Space changes, and tells nobody else.
+const spaces_poll_ms: u64 = 150;
+var carry: spaces.Carry = .{};
 pub var verbose: bool = false;
 
 const Config = config_module.Config;
@@ -360,6 +371,18 @@ fn perform(effect: Effect) void {
             const id = focused_window_id(false);
             if (id != 0) followup_push(.{ .focus_reported = id });
         },
+        .space_switch => |target| {
+            const number = desktop_target(target) orelse return;
+            if (!spaces.switch_to(number)) log("spaces: no shortcut for desktop {d}", .{number});
+        },
+        .space_send => |send| {
+            const window = window_find(send.id) orelse return;
+            const number = desktop_target(send.target) orelse return;
+            if (number == spaces_seen.desktop_number(window.space)) return;
+            if (!spaces.carry_begin(&carry, window.element, number, c.now_ms())) {
+                log("spaces: cannot carry {d} to desktop {d}", .{ send.id, number });
+            }
+        },
         .reload => config_load(true),
         .quit => {
             state_write();
@@ -578,6 +601,11 @@ fn window_discover(app: *ShellApp, element: Ref) Discovery {
     for (per_window) |notification| {
         _ = c.AXObserverAddNotification(app.observer, element, notification, context);
     }
+    if (spaces_on) {
+        var found: [1]u64 = undefined;
+        spaces.windows_spaces(&spaces_seen, &.{id}, &found);
+        window.space = found[0];
+    }
     var title_buffer: [1024]u8 = undefined;
     const title = ax.string_get(element, ax.names.title, &title_buffer);
     log("window {d} pid={d} {s} '{s}'", .{ id, app.pid, @tagName(kind), title });
@@ -593,6 +621,7 @@ fn window_discover(app: *ShellApp, element: Ref) Discovery {
         .tab_of = tab_leader(app.pid, id, frame),
         .adopted = app.adopted,
         .workspace = if (app.adopted) left.window_find(id, app.pid) else null,
+        .space = window.space,
     } });
     return .tracked;
 }
@@ -1090,6 +1119,10 @@ fn monitors_refresh() void {
     monitors_seen_count = count;
     log("monitors: {d}", .{count});
     dispatch(.{ .monitors_changed = list[0..count] });
+    // The displays were given workspaces of their own choosing; the Spaces decide.
+    if (spaces_on and spaces_seen.shown_count > 0) {
+        dispatch(.{ .spaces_shown = spaces_seen.shown_slice() });
+    }
 }
 
 /// The Dock or the menu bar changed, or the screen was unlocked. None of these is a
@@ -1143,6 +1176,70 @@ fn display_changed(display: c.CGDirectDisplayID, flags: u32, info: ?*anyopaque) 
     monitors_force = true;
     monitors_dirty_at_ms = c.now_ms() + monitors_debounce_ms;
     timer_rearm();
+}
+
+// Native Spaces.
+
+pub fn display_identity_alone(id: c.CGDirectDisplayID) u32 {
+    return display_identity(id, &.{});
+}
+
+/// Looks at which Space every display shows. When that changed, the engine is told, the
+/// windows of the Space that came into view are found (macOS lists only the windows of
+/// the Spaces that show), and every window's Space is read again.
+fn spaces_poll(initial: bool) void {
+    var snapshot: spaces.Snapshot = .{};
+    if (!spaces.read(&snapshot, display_identity_alone)) return;
+    if (!initial and snapshot.same(&spaces_seen)) return;
+    spaces_seen = snapshot;
+    for (snapshot.shown_slice()) |shown| {
+        log("spaces: display {d} shows {d}", .{ shown.display, shown.space });
+    }
+    dispatch(.{ .spaces_shown = spaces_seen.shown_slice() });
+    if (initial) return;
+    for (&apps) |*app| {
+        if (app.pid == 0 or !app.ready) continue;
+        const list = ax.copy(app.element, ax.names.windows) catch continue;
+        defer c.CFRelease(list);
+        windows_scan(app, list);
+    }
+    var ids: [engine_module.windows_max]u32 = undefined;
+    var count: usize = 0;
+    for (&windows) |*window| {
+        if (window.id == 0) continue;
+        ids[count] = window.id;
+        count += 1;
+    }
+    var found: [engine_module.windows_max]u64 = undefined;
+    spaces.windows_spaces(&spaces_seen, ids[0..count], found[0..count]);
+    for (ids[0..count], found[0..count]) |id, space| {
+        const window = window_find(id) orelse continue;
+        if (space == 0 or space == window.space) continue;
+        window.space = space;
+        dispatch(.{ .window_space = .{ .id = id, .space = space } });
+    }
+}
+
+/// The desktop that a workspace target names, as Mission Control numbers them: a number
+/// as it is, next and prev from the desktop that the display in use shows.
+fn desktop_target(target: command.Target) ?u32 {
+    switch (target) {
+        .index => |number| return if (number <= spaces_seen.desktops_count) number else null,
+        .next, .prev => {
+            if (engine.monitors_count == 0) return null;
+            const display = engine.monitors[engine.focused_monitor].display;
+            var current: u32 = 0;
+            for (spaces_seen.shown_slice()) |shown| {
+                if (shown.display == display) current = spaces_seen.desktop_number(shown.space);
+            }
+            if (current == 0) return null;
+            if (target == .next) {
+                return if (current < spaces_seen.desktops_count) current + 1 else null;
+            }
+            return if (current > 1) current - 1 else null;
+        },
+        .recent, .new, .label => return null,
+    }
 }
 
 // Hot keys.
@@ -1310,6 +1407,11 @@ fn timer_fired(fired: Ref, info: ?*anyopaque) callconv(.c) void {
         monitors_refresh();
     }
     probes_run(now);
+    if (spaces_on and spaces_poll_at_ms <= now) {
+        spaces_poll_at_ms = now + spaces_poll_ms;
+        spaces_poll(false);
+    }
+    if (carry.at_ms != 0) spaces.carry_step(&carry, now);
     if (state_dirty_at_ms != 0 and state_dirty_at_ms <= now) {
         apps_reap();
         state_write();
@@ -1330,8 +1432,9 @@ fn timer_rearm() void {
     var next: ?u64 = engine.next_deadline_ms();
     if (quit_requested) next = 1;
     const extras = [_]u64{
-        drag_poll_at_ms,        monitors_dirty_at_ms, repeat_at_ms,
-        monitors_recheck_at_ms, state_dirty_at_ms,    border_reorder_at_ms,
+        drag_poll_at_ms,                         monitors_dirty_at_ms, repeat_at_ms,
+        monitors_recheck_at_ms,                  state_dirty_at_ms,    border_reorder_at_ms,
+        if (spaces_on) spaces_poll_at_ms else 0, carry.at_ms,
     };
     for (extras) |at| {
         if (at != 0 and (next == null or at < next.?)) next = at;
@@ -1407,6 +1510,9 @@ fn config_load(reload: bool) void {
     } else {
         return;
     }
+    const wanted = engine.config.spaces_native;
+    spaces_on = wanted and spaces.init();
+    if (wanted and !spaces_on) log("spaces: this macOS does not have the calls; virtual", .{});
     if (reload) {
         mode_current = 0;
         repeat_at_ms = 0;
@@ -1672,6 +1778,7 @@ pub fn run() noreturn {
     for (&probes) |*probe| probe.* = .{};
     monitors_refresh();
     state_read();
+    if (spaces_on) spaces_poll(true);
     apps_adopt();
     focus_notify();
     border_refresh(true);

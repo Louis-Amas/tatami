@@ -118,6 +118,57 @@ Amethyst, Rectangle, Hammerspoon and komorebi has a row in
 [docs/EDGE-CASES.md](docs/EDGE-CASES.md): what tatami does about it and the test that
 shows it.
 
+## Amethyst mode
+
+tatami also tiles the way Amethyst does: by layouts that place the windows by their order
+alone, with a main pane whose size and count you change.
+
+```sh
+tatami default-config amethyst > ~/.config/tatami/tatami.conf   # then: tatami reload
+```
+
+That configuration has Amethyst's default shortcuts (mod1 = option-shift, mod2 =
+ctrl-option-shift): mod1-space and mod2-space cycle the layouts, mod1-h/l shrink and
+expand the main pane, mod1-, and mod1-. change how many windows it holds, mod1-enter swaps
+the focused window into it, mod1-j/k and mod2-j/k focus and swap around the layout,
+mod1-w/e/r and mod2-w/e/r focus and throw to screens 1 to 3, mod1-p/n go from screen to
+screen, mod1-a/s/d/f pick tall, wide, fullscreen and column, mod1-t floats a window.
+
+| Layout | Tiles |
+|---|---|
+| `tall`, `tall-right` | main pane on the left (right), the others in rows beside it |
+| `wide` | main pane on top, the others in columns below |
+| `two-pane` | main pane and one other; the rest stack behind that one |
+| `3column-left`, `3column-middle` (`middle-wide`), `3column-right` | main column there, the others shared by the two other columns |
+| `widescreen-tall` | as tall, with the main pane in columns |
+| `column`, `row` | one column (row) per window; the first ones are the main pane |
+| `fullscreen` | every window fills the screen (the accordion) |
+| `bsp` | tatami's own tree |
+
+With `spaces native` (on in that configuration), every macOS Space is a workspace, as in
+Amethyst: each Space on each display keeps its own layout, main pane count and main pane
+size, macOS shows and hides the Spaces, and tatami leaves the windows of a Space that does
+not show where they are. mod2-number throws the focused window to that desktop the way
+Amethyst does: it holds the window by its title bar while Mission Control's "Switch to
+Desktop N" shortcut is pressed, which is switched on if it was off. Do not bind those
+shortcuts (ctrl-1 to ctrl-9 by default) in tatami. Which Space shows is read every 150 ms,
+since macOS announces it only to AppKit applications. The Space calls are SkyLight's, as
+yabai's and Amethyst's are, looked up at startup; `tatami check` says what it sees. Without
+`spaces native`, workspaces are tatami's own and hidden ones are parked, as before.
+
+A window thrown to another screen takes that screen's layout. Screens are numbered left to right, as in
+Amethyst. `layouts tall wide fullscreen` in the config sets the cycle; its first layout is
+where every workspace starts. Without the line the cycle has every layout, starting with
+bsp, so nothing changes for an existing configuration.
+
+The tree stays underneath every layout: `layout bsp` brings the tiles back where they
+were, in their new order. Swap, warp and the mouse change the order; a drag of a tile's
+edge, or `resize`, sizes the main pane. `query workspaces` shows each workspace's layout,
+main count and share, and the state file keeps them over a restart.
+
+Commands: `layout <name>` (tile the whole workspace that way), `layout next|prev`,
+`main expand|shrink|more|fewer|swap|focus`, `swap next|prev`.
+
 ## Bar
 
 An optional bar over the menu bar, with the workspaces, the focused window's title, chosen

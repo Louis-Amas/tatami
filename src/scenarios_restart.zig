@@ -373,7 +373,9 @@ fn expect_same_desk(a: *Engine, b: *Engine) !void {
             });
         }
         if (one.gaps_toggled != two.gaps_toggled) return differ("gaps of {d}", .{number});
-        if (one.accordion != two.accordion) return differ("accordion of {d}", .{number});
+        if (one.tiling != two.tiling) return differ("layout of {d}", .{number});
+        if (one.main_count != two.main_count) return differ("main count of {d}", .{number});
+        if (one.main_ratio != two.main_ratio) return differ("main ratio of {d}", .{number});
         if (!std.mem.eql(u8, one.label.slice(), two.label.slice())) {
             return differ("workspace {d} was labelled '{s}', now '{s}'", .{
                 number, one.label.slice(), two.label.slice(),
@@ -682,7 +684,7 @@ test "sticky windows, zoom, labels, toggled gaps and an accordion come back as t
     try testing.expectEqualStrings("logs", known(c).label.slice());
     try testing.expectEqualStrings("code", second.workspaces[0].label.slice());
     try testing.expect(second.workspaces[0].gaps_toggled);
-    try testing.expect(second.workspaces[0].accordion);
+    try testing.expect(second.workspaces[0].tiling == .fullscreen);
     try testing.expect(known(c).sticky);
     try testing.expectEqual(engine_module.Zoom.fullscreen, known(a).zoom);
     try testing.expectEqual(engine_module.Zoom.none, known(b).zoom);
@@ -1029,7 +1031,10 @@ fn garbage(prng: *stdx.Prng, os: *sim.Simulator, state: *State) void {
             .focused = prng.chance(1, 3),
             .recent = prng.chance(1, 3),
             .gaps = prng.chance(1, 3),
-            .accordion = prng.chance(1, 3),
+            .tiling = @intCast(prng.below(16)),
+            .main_count = @intCast(prng.below(256)),
+            .main_ratio = if (prng.chance(1, 2)) prng.below(1 << 17) else 0xffff_ffff,
+            .space = if (prng.chance(1, 2)) prng.below(4) else 0,
             .label = garbage_label(prng),
         };
     }
@@ -1111,8 +1116,8 @@ test "a file that is cut short is believed as far as it goes" {
     file_len = header + std.mem.indexOfScalar(u8, file[header..file_len], '\n').? + 1;
     // The workspaces come first in it; without them, the windows are still believed.
     const line = file[header..file_len];
-    std.mem.copyForwards(u8, file["tatami-state 3\n".len..], line);
-    file_len = "tatami-state 3\n".len + line.len;
+    std.mem.copyForwards(u8, file["tatami-state 5\n".len..], line);
+    file_len = "tatami-state 5\n".len + line.len;
     start(os, &second, .{});
     try testing.expectEqual(@as(u32, 1), left.windows_count);
     try testing.expectEqual(a, left.windows[0].id);

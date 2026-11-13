@@ -23,8 +23,11 @@ comptime {
     assert(modes_max <= 8);
 }
 pub const mode_name_max = 16;
+pub const tilings_count = std.enums.values(command.Tiling).len;
 
 pub const default_source = @embedFile("default.conf");
+/// Amethyst's layouts and default shortcuts: 'tatami default-config amethyst'.
+pub const amethyst_source = @embedFile("amethyst.conf");
 
 pub const Modifiers = packed struct(u8) {
     cmd: bool = false,
@@ -183,6 +186,8 @@ const LineError = error{
     TooManyRules,
     BadGap,
     BadBorder,
+    BadLayout,
+    BadSpaces,
     BadRule,
     BadAction,
     BadMode,
@@ -199,6 +204,13 @@ pub const Config = struct {
     border_radius: i32,
     /// 0xAARRGGBB.
     border_color: u32,
+    /// The layouts that 'layout next' and 'layout prev' go through, in order. The first
+    /// is the one every workspace starts with.
+    layouts: [tilings_count]command.Tiling,
+    layouts_count: u8,
+    /// Workspaces are macOS Spaces: one workspace stands for each Space, macOS shows and
+    /// hides them, and the workspace commands switch Spaces through Mission Control.
+    spaces_native: bool,
     bindings: [bindings_max]Binding,
     bindings_count: u32,
     rules: [rules_max]Rule,
@@ -214,6 +226,9 @@ pub const Config = struct {
         config.border_width = 0;
         config.border_radius = 0;
         config.border_color = 0xff4c7899;
+        for (std.enums.values(command.Tiling), 0..) |tiling, index| config.layouts[index] = tiling;
+        config.layouts_count = tilings_count;
+        config.spaces_native = false;
         config.bindings_count = 0;
         config.rules_count = 0;
         config.strings = .{};
@@ -334,6 +349,15 @@ pub const Config = struct {
         const rest = command.trim(line[space..]);
         if (std.mem.eql(u8, directive, "gap")) return config.load_gap(rest);
         if (std.mem.eql(u8, directive, "border")) return config.load_border(rest);
+        if (std.mem.eql(u8, directive, "layouts")) return config.load_layouts(rest);
+        if (std.mem.eql(u8, directive, "spaces")) {
+            if (std.mem.eql(u8, rest, "native")) {
+                config.spaces_native = true;
+            } else if (std.mem.eql(u8, rest, "virtual")) {
+                config.spaces_native = false;
+            } else return error.BadSpaces;
+            return;
+        }
         if (std.mem.eql(u8, directive, "bind")) return config.load_binding(rest);
         if (std.mem.eql(u8, directive, "rule")) return config.load_rule(rest);
         return error.UnknownDirective;
@@ -353,6 +377,31 @@ pub const Config = struct {
         } else {
             return error.BadGap;
         }
+    }
+
+    /// layouts <name> [<name> ...]: the cycle, each layout at most once.
+    fn load_layouts(config: *Config, rest: []const u8) LineError!void {
+        var count: u8 = 0;
+        var words = std.mem.tokenizeAny(u8, rest, " \t");
+        while (words.next()) |word| {
+            const tiling = command.Tiling.parse(word) orelse return error.BadLayout;
+            if (count == tilings_count) return error.BadLayout;
+            for (config.layouts[0..count]) |seen| {
+                if (seen == tiling) return error.BadLayout;
+            }
+            config.layouts[count] = tiling;
+            count += 1;
+        }
+        if (count == 0) return error.BadLayout;
+        config.layouts_count = count;
+    }
+
+    /// Where a layout is in the cycle, or null when the cycle leaves it out.
+    pub fn layout_index(config: *const Config, tiling: command.Tiling) ?u8 {
+        for (config.layouts[0..config.layouts_count], 0..) |entry, index| {
+            if (entry == tiling) return @intCast(index);
+        }
+        return null;
     }
 
     fn load_border(config: *Config, rest: []const u8) LineError!void {
@@ -755,4 +804,45 @@ test "a bad line that is very long is still reported, by its start" {
     try testing.expect(std.mem.indexOf(u8, report, "xxx...\nline 3: BadKey") != null);
     try testing.expect(report.len < 300);
     try testing.expect(!diagnostics.truncated);
+}
+
+test "the amethyst configuration loads, with its layouts and its shortcuts" {
+    var config: Config = undefined;
+    var buffer: [1024]u8 = undefined;
+    var diagnostics = stdx.Text.init(&buffer);
+    try testing.expect(config.load(amethyst_source, &diagnostics));
+    try testing.expectEqualStrings("", diagnostics.slice());
+    try testing.expectEqual(@as(u8, 4), config.layouts_count);
+    try testing.expectEqual(command.Tiling.tall, config.layouts[0]);
+    try testing.expectEqual(@as(?u8, 2), config.layout_index(.fullscreen));
+    try testing.expectEqual(@as(?u8, null), config.layout_index(.bsp));
+    const mod1: Modifiers = .{ .alt = true, .shift = true };
+    const mod2: Modifiers = .{ .ctrl = true, .alt = true, .shift = true };
+    const cycle = config.binding_find(mod1, 49).?;
+    try testing.expectEqual(Command{ .layout = .{ .cycle = true } }, cycle.commands[0]);
+    const back = config.binding_find(mod2, 49).?;
+    try testing.expectEqual(Command{ .layout = .{ .cycle = false } }, back.commands[0]);
+    const swap = config.binding_find(mod1, 36).?;
+    try testing.expectEqual(Command{ .main = .swap }, swap.commands[0]);
+    // Counter clockwise is the window before, as in Amethyst.
+    const counter = config.binding_find(mod2, 38).?;
+    try testing.expectEqual(Command{ .swap_cycle = false }, counter.commands[0]);
+    const focus = config.binding_find(mod1, 40).?;
+    const next: Command = .{ .focus_cycle = .{ .forward = true, .wrap = true } };
+    try testing.expectEqual(next, focus.commands[0]);
+}
+
+test "the layout cycle: every name once, at least one, and all of them when not given" {
+    var config: Config = undefined;
+    var buffer: [1024]u8 = undefined;
+    var diagnostics = stdx.Text.init(&buffer);
+    try testing.expect(config.load("gap inner 0\n", &diagnostics));
+    try testing.expectEqual(command.Tiling.bsp, config.layouts[0]);
+    try testing.expectEqual(@as(u8, tilings_count), config.layouts_count);
+    try testing.expect(config.load("layouts middle-wide bsp\n", &diagnostics));
+    try testing.expectEqual(command.Tiling.three_column_middle, config.layouts[0]);
+    try testing.expectEqual(@as(u8, 2), config.layouts_count);
+    try testing.expect(!config.load("layouts tall tall\n", &diagnostics));
+    try testing.expect(!config.load("layouts tower\n", &diagnostics));
+    try testing.expect(!config.load("layouts float\n", &diagnostics));
 }

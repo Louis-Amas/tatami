@@ -1,8 +1,9 @@
 //! The state file: what a tatami that quits, or dies, leaves for the one that starts next,
 //! so that a restart changes nothing. It holds what the engine says there is to remember:
-//! for every workspace its display, whether it was showing and in use, its gaps, whether
-//! its tiles were stacked as an accordion, and its label; for every window its workspace,
-//! its mode, its place in the layout and the rest of engine.WindowMemory.
+//! for every workspace its display, whether it was showing and in use, its gaps, its
+//! layout with the count and the share of its main pane, the macOS Space it stands for
+//! with native Spaces, and its label; for every window
+//! its workspace, its mode, its place in the layout and the rest of engine.WindowMemory.
 //!
 //! The file is text, one record per line: a word and then every field of the record in
 //! the order the engine declares them, flags as 0 or 1, a rect as four numbers, a label
@@ -24,7 +25,7 @@ const Label = command.Label;
 
 /// Room for the longest file there can be: every window with every number at its widest.
 pub const bytes_max: usize = 64 * 1024;
-const header = "tatami-state 3";
+const header = "tatami-state 5";
 
 /// What is kept of a window. Window ids outlive the manager but not the login session,
 /// so the process is kept too: an id that now belongs to another process is someone else.
@@ -158,18 +159,20 @@ const two_windows =
 
 test "the state file is read back as it was written" {
     var state: State = .{};
-    const source = "tatami-state 3\n" ++
-        "workspace 0 77 1 1 0 0 0 -\n" ++
-        "workspace 4 78 0 0 1 1 1 mail\n" ++
-        "workspace 5 0 0 0 0 0 0 -\n" ++
+    const source = "tatami-state 5\n" ++
+        "workspace 0 77 1 1 0 0 0 1 32768 0 -\n" ++
+        "workspace 4 78 0 0 1 1 11 1 32768 0 mail\n" ++
+        "workspace 5 0 0 0 0 0 0 1 32768 0 -\n" ++
         two_windows;
     parse(source, &state);
     try testing.expectEqual(@as(u32, 3), state.workspaces_count);
     try testing.expectEqual(@as(u32, 78), state.workspaces[1].display);
     try testing.expect(state.workspaces[0].shown and !state.workspaces[1].shown);
     try testing.expect(state.workspaces[0].focused and state.workspaces[1].recent);
-    try testing.expect(state.workspaces[1].gaps and state.workspaces[1].accordion);
-    try testing.expect(!state.workspaces[0].accordion);
+    try testing.expect(state.workspaces[1].gaps);
+    const fullscreen: u8 = @backingInt(command.Tiling.fullscreen);
+    try testing.expectEqual(fullscreen, state.workspaces[1].tiling);
+    try testing.expectEqual(@as(u8, 0), state.workspaces[0].tiling);
     try testing.expectEqualStrings("mail", state.workspaces[1].label.slice());
     try testing.expectEqual(@as(?u8, 4), state.window_find(186, 501));
     try testing.expectEqual(@as(?u8, 0), state.window_find(187, 502));
@@ -193,16 +196,16 @@ test "the state file is read back as it was written" {
 test "a state file that is cut short, stale or nonsense loses only the lines that are" {
     var state: State = .{};
     // The last line has no line break: it may be half a number.
-    parse("tatami-state 3\n" ++ two_windows[0 .. two_windows.len - 1], &state);
+    parse("tatami-state 5\n" ++ two_windows[0 .. two_windows.len - 1], &state);
     try testing.expectEqual(@as(u32, 1), state.windows_count);
-    const source = "tatami-state 3\n" ++
-        "workspace 16 77 1 0 0 0 0 -\n" ++
+    const source = "tatami-state 5\n" ++
+        "workspace 16 77 1 0 0 0 0 1 32768 0 -\n" ++
         "workspace 3 77\n" ++
-        "workspace 3 77 1 0 0 0 0 - 9\n" ++
-        "workspace -1 77 1 0 0 0 0 -\n" ++
-        "workspace 3 77 2 0 0 0 0 -\n" ++
-        "workspace 3 77 1 0 0 0 0 next\n" ++
-        "workspace 3 77 1 0 0 0 0 a-label-that-is-far-too-long-to-be-one\n" ++
+        "workspace 3 77 1 0 0 0 0 1 32768 0 - 9\n" ++
+        "workspace -1 77 1 0 0 0 0 1 32768 0 -\n" ++
+        "workspace 3 77 2 0 0 0 0 1 32768 0 -\n" ++
+        "workspace 3 77 1 0 0 0 0 1 32768 0 next\n" ++
+        "workspace 3 77 1 0 0 0 0 1 32768 0 a-label-that-is-far-too-long-to-be-one\n" ++
         "window 0 501 4 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 3 32768 0 -\n" ++
         "window 186 0 4 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 3 32768 0 -\n" ++
         "window 186 -5 4 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 3 32768 0 -\n" ++
